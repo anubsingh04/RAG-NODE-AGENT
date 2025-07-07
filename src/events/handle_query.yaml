@@ -1,7 +1,7 @@
 "mcp.handle-query":
   fn: mcp_server
   type: tool
-  summary: Handle query from Roocode
+  summary: Handle query from Saarthi
   description: Responds to natural language questions using internal RAG pipeline.
   body:
     type: object

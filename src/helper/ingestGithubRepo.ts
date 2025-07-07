@@ -255,7 +255,7 @@ async function ingestUploadedFile(
   for (let i = 0; i < pages.length; i++) {
     const pageContent = pages[i];
     const pageId = `${docId}_page_${i + 1}`;
-    await vs.upsertDoc(pageId, pageContent);
+    await vs.upsert(pageId, pageContent);
   }
   logger.info(`Document '${filename}' ingested successfully.`);
   return `Document '${filename}' ingested successfully.`;

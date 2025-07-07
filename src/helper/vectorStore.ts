@@ -1,219 +1,298 @@
-import { IndexFlatL2 } from 'faiss-node';
+import { ChromaClient, IncludeEnum } from "chromadb";
+import { GoogleGeminiEmbeddingFunction } from "@chroma-core/google-gemini";
 import * as fs from 'fs';
 import * as path from 'path';
-import  { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai";
-import { logger } from '@godspeedsystems/core';
-
+import crypto from 'crypto';
+import pLimit from 'p-limit';
 
 interface Metadata {
   [docId: string]: {
     content: string;
+    documentType?: string;
+    createdAt?: string;
+    lastModified?: string;
   };
 }
 
+interface ChunkMetadata {
+  id: string;
+  content: string;
+  startIndex: number;
+  endIndex: number;
+  chunkType: 'paragraph' | 'section' | 'code' | 'list';
+}
+
+interface SearchResult {
+  docId: string;
+  chunkId: string;
+  chunkContent: string;
+  metadata: {
+    documentType?: string;
+    chunkType: string;
+  };
+  relevanceScore: number;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+const chromaLimit = pLimit(3); // max 3 concurrent ChromaDB calls
+
+async function safeChroma<T>(fn: () => Promise<T>, retries = 3): Promise<T> {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await chromaLimit(fn);
+    } catch (err: any) {
+      const isRecoverable =
+        err?.message?.includes("ECONNREFUSED") ||
+        err?.message?.includes("Failed to connect to chromadb") ||
+        err?.message?.includes("connection") ||
+        err?.message?.includes("fetch failed");
+
+      if (isRecoverable && i < retries - 1) {
+        const wait = 1000 * Math.pow(2, i);
+        console.warn(`[ChromaDB] Retrying in ${wait / 1000}s...`);
+        await sleep(wait);
+      } else {
+        throw err;
+      }
+    }
+  }
+  throw new Error("ChromaDB request failed after retries");
+}
+
 export class VectorStore {
-  private indexPath: string;
   private metaPath: string;
-  private docIdMapPath: string;
-  private model: GoogleGenerativeAIEmbeddings;
-  private index: IndexFlatL2;
+  private chunkMapPath: string;
   public metadata: Metadata = {};
-  private docIdByVectorIdx: string[] = [];
+  private chunkMap: Record<string, ChunkMetadata[]> = {};
+  private client: ChromaClient;
+  private collectionName = 'rag-collection';
+  private embedder: GoogleGeminiEmbeddingFunction;
 
   constructor(
-    indexPath = path.resolve(__dirname, '../../index/index.faiss'),
     metaPath = path.resolve(__dirname, '../../index/metadata.json'),
-    docIdMapPath = path.resolve(__dirname, '../../index/docIdMap.json')
-  ){
+    chunkMapPath = path.resolve(__dirname, '../../index/chunkmap.json')
+  ) {
     const apiKey = process.env.GOOGLE_API_KEY;
     if (!apiKey) throw new Error('Missing GOOGLE_API_KEY in .env');
 
-    this.indexPath = indexPath;
     this.metaPath = metaPath;
-    this.docIdMapPath = docIdMapPath;
-    this.metadata = {};
-    this.docIdByVectorIdx = [];
+    this.chunkMapPath = chunkMapPath;
 
-    this.model = new GoogleGenerativeAIEmbeddings({
-      apiKey: apiKey,
-      modelName: 'models/embedding-001'
-    });
+    this.embedder = new GoogleGeminiEmbeddingFunction({ apiKey });
+    this.client = new ChromaClient({ host: "localhost", port: 10947, ssl: false });
 
-    const dim = 768;
-    if (fs.existsSync(this.indexPath)) {
-      this.index = IndexFlatL2.read(this.indexPath) as IndexFlatL2;
-    } else {
-      this.index = new IndexFlatL2(dim);
-    }
+    this.load();
+  }
 
+  private load(): void {
     if (fs.existsSync(this.metaPath)) {
-      this.metadata = JSON.parse(fs.readFileSync(this.metaPath, 'utf-8'));
+      try {
+        this.metadata = JSON.parse(fs.readFileSync(this.metaPath, 'utf-8'));
+      } catch (e) {
+        console.error('[ERROR] Failed to load metadata:', e);
+      }
     }
 
-    if (fs.existsSync(this.docIdMapPath)) {
-      this.docIdByVectorIdx = JSON.parse(fs.readFileSync(this.docIdMapPath, 'utf-8'));
+    if (fs.existsSync(this.chunkMapPath)) {
+      try {
+        this.chunkMap = JSON.parse(fs.readFileSync(this.chunkMapPath, 'utf-8'));
+      } catch (e) {
+        console.error('[ERROR] Failed to load chunkMap:', e);
+      }
     }
-  }
-  async upsert(docId: string, content: string): Promise<void> {
-        
-        const chunks = this.chunkText(content);
-        const embeddings = await this.model.embedDocuments(chunks);
-        const flatEmbeddings = embeddings.flat();
-        this.index.add(flatEmbeddings);
-        for (let i = 0; i < embeddings.length; i++) {
-            this.docIdByVectorIdx.push(docId);
-        }
-        this.metadata[docId] = {
-            content
-        };
-        this.save();
-    }
-
-  async search(query: string, k = 5): Promise<any[]> {
-        const queryVec = await this.model.embedQuery(query);
-        const queryArray = queryVec;
-        const result = this.index.search(queryArray, k);
-        const hits = [];
-        for (let i = 0; i < result.labels.length; i++) {
-            const idx = result.labels[i];
-            const docId = this.docIdByVectorIdx[idx];
-            if (docId && this.metadata[docId]) {
-                hits.push({
-                    docId:docId,
-                    content: this.metadata[docId].content
-                });
-            }
-        }
-        return hits;
-  }
-  async upsertDoc(docId: string, content: string): Promise<void> {
-    this.upsert(docId,content);
   }
 
   private ensureDir(filePath: string) {
-  const dir = path.dirname(filePath);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   }
- }
 
   private save(): void {
-  try {
-    this.ensureDir(this.indexPath);
-    this.index.write(this.indexPath);
-  } catch (err) {
-    logger.error("Failed to write index:", err);
-  }
-
-  try {
-    this.ensureDir(this.metaPath);
-    fs.writeFileSync(this.metaPath, JSON.stringify(this.metadata, null, 2));
-  } catch (err) {
-    logger.error("Failed to write metadata:", err);
-  }
-
-  try {
-    this.ensureDir(this.docIdMapPath);
-    fs.writeFileSync(this.docIdMapPath, JSON.stringify(this.docIdByVectorIdx, null, 2));
-  } catch (err) {
-    logger.error("Failed to write docId map:", err);
-  }
-}
-
-  async removeDocument(docId: string) {
-    if (!(docId in this.metadata)) {
-        logger.info(`[${docId}] Not found in index. Skipping removal.`);
-        return;
+    try {
+      this.ensureDir(this.metaPath);
+      fs.writeFileSync(this.metaPath, JSON.stringify(this.metadata, null, 2));
+      fs.writeFileSync(this.chunkMapPath, JSON.stringify(this.chunkMap, null, 2));
+    } catch (err) {
+      console.error('Failed to write metadata or chunkMap:', err);
     }
+  }
 
-    // Step 1: Identify vector indices to remove
-    const indicesToRemove = [];
-    for (let i = 0; i < this.docIdByVectorIdx.length; i++) {
-        if (this.docIdByVectorIdx[i] === docId) {
-            indicesToRemove.push(i);
+  private semanticChunkText(text: string): ChunkMetadata[] {
+    const chunks: ChunkMetadata[] = [];
+    const paragraphs = text.split(/\n\s*\n/);
+    let cursor = 0;
+
+    for (const paragraph of paragraphs) {
+      const trimmed = paragraph.trim();
+      if (trimmed.length === 0) continue;
+
+      const chunkType = paragraph.includes('```') || /function|class/.test(paragraph) ? 'code'
+        : /^\s*[-*+]\s|^\s*\d+\.\s/.test(paragraph) ? 'list'
+        : /^#{1,6}\s|^[A-Z][A-Z\s]+$/.test(paragraph) ? 'section'
+        : 'paragraph';
+
+      if (trimmed.length > 1000 && chunkType === 'paragraph') {
+        const sentences = trimmed.split(/[.!?]+/);
+        let currentChunk = '';
+        for (const sentence of sentences) {
+          if ((currentChunk + sentence).length > 1000 && currentChunk.length > 0) {
+            chunks.push({
+              id: crypto.randomUUID(),
+              content: currentChunk.trim(),
+              startIndex: cursor,
+              endIndex: cursor + currentChunk.trim().length,
+              chunkType: 'paragraph',
+            });
+            cursor += currentChunk.length;
+            currentChunk = sentence;
+          } else {
+            currentChunk += sentence + '. ';
+          }
         }
-    }
-
-    if (indicesToRemove.length === 0) {
-        logger.info(`[${docId}] No associated vectors found. Only metadata removed.`);
-        delete this.metadata[docId];
-        this.save();
-        return;
-    }
-
-    // Step 2: Remove vectors from FAISS index
-    const removedCount = this.index.removeIds(indicesToRemove);
-    logger.info(`[${docId}] Removed ${removedCount} vectors from FAISS index.`);
-
-    // Step 3: Remove metadata
-    delete this.metadata[docId];
-
-    // Step 4: Rebuild docIdByVectorIdx (preserving correct order after FAISS shift)
-    const removalSet = new Set(indicesToRemove);
-    this.docIdByVectorIdx = this.docIdByVectorIdx.filter((_, idx) => !removalSet.has(idx));
-
-    // Step 5: Save all state
-    this.save();
-    logger.info(`[${docId}] Document fully removed and index state updated.`);
- }
-
-
-  async removeUploadedDocs(docId: string) {
-    // Step 1: Find all metadata keys that belong to this docId (e.g., doc1_page_0, doc1_page_1)
-    const keysToDelete = Object.keys(this.metadata).filter(key =>
-        key.startsWith(`${docId}_page_`)
-    );
-
-    if (keysToDelete.length === 0) {
-        logger.info(`[${docId}] Not found in index. Skipping removal.`);
-        return;
-    }
-
-    // Step 2: Identify vector indices to remove
-    const removalKeysSet = new Set(keysToDelete);
-    const indicesToRemove: number[] = [];
-
-    for (let i = 0; i < this.docIdByVectorIdx.length; i++) {
-        const vectorDocId = this.docIdByVectorIdx[i];
-        if (removalKeysSet.has(vectorDocId)) {
-            indicesToRemove.push(i);
+        if (currentChunk.trim().length > 0) {
+          chunks.push({
+            id: crypto.randomUUID(),
+            content: currentChunk.trim(),
+            startIndex: cursor,
+            endIndex: cursor + currentChunk.trim().length,
+            chunkType: 'paragraph',
+          });
+          cursor += currentChunk.length;
         }
+      } else {
+        chunks.push({
+          id: crypto.randomUUID(),
+          content: trimmed,
+          startIndex: cursor,
+          endIndex: cursor + trimmed.length,
+          chunkType,
+        });
+        cursor += paragraph.length + 2;
+      }
     }
 
-    // Step 3: Remove vectors from FAISS index
-    if (indicesToRemove.length > 0) {
-        const removedCount = this.index.removeIds(indicesToRemove);
-         logger.info(`[${docId}] Removed ${removedCount} vectors from FAISS index.`);
-    } else {
-         logger.info(`[${docId}] No vectors found. Only metadata removed.`);
-    }
-
-    // Step 4: Remove metadata
-    for (const key of keysToDelete) {
-        delete this.metadata[key];
-    }
-
-    // Step 5: Rebuild docIdByVectorIdx
-    const indicesToRemoveSet = new Set(indicesToRemove);
-    this.docIdByVectorIdx = this.docIdByVectorIdx.filter((_, idx) => !indicesToRemoveSet.has(idx));
-
-    // Step 6: Save
-    this.save();
-
-     logger.info(`[${docId}] Document and all page metadata fully removed.`);
-}
-
-
-  chunkText(text:string, maxTokens = 500, overlap = 100) {
-    const words = text.split(/\s+/);
-    const chunks = [];
-    let start = 0;
-    while (start < words.length) {
-        const end = Math.min(start + maxTokens, words.length);
-        chunks.push(words.slice(start, end).join(' '));
-        start += maxTokens - overlap;
-    }
     return chunks;
   }
 
+  async upsert(docId: string, content: string, documentType?: string): Promise<void> {
+    const chunks = this.semanticChunkText(content);
+    const collection = await safeChroma(() =>
+      this.client.getOrCreateCollection({
+        name: this.collectionName,
+        embeddingFunction: this.embedder,
+      })
+    );
+
+    const BATCH_SIZE = 100;
+    const DELAY_MS = 500;
+
+    for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+      const batch = chunks.slice(i, i + BATCH_SIZE);
+
+      let retries = 0;
+      let success = false;
+
+      while (!success && retries < 3) {
+        try {
+          await safeChroma(() =>
+            collection.upsert({
+              ids: batch.map(chunk => chunk.id),
+              documents: batch.map(chunk => chunk.content),
+              metadatas: batch.map(chunk => {
+                const base: Record<string, string> = {
+                  docId,
+                  chunkType: chunk.chunkType,
+                };
+                return documentType ? { ...base, documentType } : base;
+              }),
+            })
+          );
+          success = true;
+        } catch (err) {
+          console.error(`[Gemini/Chroma] Upsert error:`, err);
+          const wait = 2000 * (retries + 1);
+          await sleep(wait);
+          retries++;
+        }
+      }
+
+      if (success && i + BATCH_SIZE < chunks.length) {
+        await sleep(DELAY_MS);
+      }
+    }
+
+    this.metadata[docId] = {
+      content,
+      documentType,
+      createdAt: new Date().toISOString(),
+      lastModified: new Date().toISOString(),
+    };
+    this.chunkMap[docId] = chunks;
+    this.save();
+  }
+
+  async removeDocument(docId: string) {
+    if (!(docId in this.metadata)) return;
+
+    const collection = await safeChroma(() =>
+      this.client.getOrCreateCollection({
+        name: this.collectionName,
+        embeddingFunction: this.embedder,
+      })
+    );
+
+    const chunkIds = (this.chunkMap[docId] || []).map(chunk => chunk.id);
+    if (chunkIds.length > 0) {
+      await safeChroma(() => collection.delete({ ids: chunkIds }));
+    }
+
+    delete this.metadata[docId];
+    delete this.chunkMap[docId];
+    this.save();
+  }
+
+  async search(query: string, k = 10, filters?: { documentType?: string; chunkType?: string }): Promise<SearchResult[]> {
+    const collection = await safeChroma(() =>
+      this.client.getCollection({
+        name: this.collectionName,
+        embeddingFunction: this.embedder,
+      })
+    );
+
+    const filterConditions: Record<string, any>[] = [];
+    if (filters?.documentType) filterConditions.push({ documentType: filters.documentType });
+    if (filters?.chunkType) filterConditions.push({ chunkType: filters.chunkType });
+    const where = filterConditions.length > 0 ? { $and: filterConditions } : undefined;
+
+    const results = await safeChroma(() =>
+      collection.query({
+        queryTexts: [query],
+        nResults: k,
+        where,
+        include: ["documents", "metadatas", "distances"] as IncludeEnum[],
+      })
+    );
+
+    const output: SearchResult[] = [];
+    for (let i = 0; i < results.ids[0].length; i++) {
+      output.push({
+        docId: String(results.metadatas?.[0][i]?.docId ?? ''),
+        chunkId: results.ids[0][i],
+        chunkContent: String(results.documents?.[0][i] ?? ''),
+        metadata: {
+          documentType: String(results.metadatas?.[0][i]?.documentType ?? ''),
+          chunkType: String(results.metadatas?.[0][i]?.chunkType ?? ''),
+        },
+        relevanceScore: results.distances?.[0][i] ?? 0,
+      });
+    }
+    return output;
+  }
+
+  getChunks(docId: string): ChunkMetadata[] {
+    return this.chunkMap[docId] || [];
+  }
 }
