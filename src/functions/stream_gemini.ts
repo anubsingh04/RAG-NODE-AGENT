@@ -10,8 +10,6 @@ import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { getPrompts } from '../helper/prompts';
 import { createRedisMemorySaver } from '../helper/memory';
 
-const seenThreads = new Set<string>();
-
 export default async function stream_gemini(ctx: GSContext): Promise<GSStatus> {
   const { ws ,clientId, payload } = ctx.inputs.data;
 
@@ -84,20 +82,25 @@ export default async function stream_gemini(ctx: GSContext): Promise<GSStatus> {
   graph.addConditionalEdges("agent", shouldRetrieve);
   graph.addEdge('tools', 'agent');
  
-  const { core_system_prompt, tool_knowledge_prompt } = getPrompts();
-  const systemPromot = Array(core_system_prompt, tool_knowledge_prompt).join('\n');
-
   const redisMemorySaver = createRedisMemorySaver(ctx);
   const runnable = graph.compile({
     checkpointer: redisMemorySaver
   });
 
   const threadId = clientId;
-  const messages: BaseMessage[] = [];
+  const { core_system_prompt, tool_knowledge_prompt } = getPrompts();
+  const systemPrompt = Array(core_system_prompt, tool_knowledge_prompt).join('\n');
 
-  if (!seenThreads.has(threadId)) {
-    messages.push(new SystemMessage(systemPromot));
-    seenThreads.add(threadId);
+  // Check if this is the first message for this thread by trying to get existing checkpoint
+  const existingCheckpoint = await redisMemorySaver.getTuple({
+    configurable: { thread_id: threadId }
+  });
+
+  const messages: BaseMessage[] = [];
+  
+  // Only add system message if this is a new thread (no existing checkpoint)
+  if (!existingCheckpoint) {
+    messages.push(new SystemMessage(systemPrompt));
   }
 
   messages.push(new HumanMessage(payload.message));
