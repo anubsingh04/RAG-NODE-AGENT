@@ -45,6 +45,7 @@
 		"@godspeedsystems/plugins-axios-as-datasource": "^1.0.6",
 		"@godspeedsystems/plugins-cron-as-eventsource": "^1.0.0",
 		"@godspeedsystems/plugins-express-as-http": "^1.0.25",
+		"@godspeedsystems/plugins-redis-as-datasource": "^1.0.4",
 		"@langchain/core": "^0.3.61",
 		"@langchain/google-genai": "^0.2.10",
 		"@langchain/langgraph": "^0.3.5",

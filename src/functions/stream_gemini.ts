@@ -1,6 +1,6 @@
 import { GSContext, GSStatus } from '@godspeedsystems/core';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
-import { StateGraph, END, MemorySaver, Annotation } from '@langchain/langgraph';
+import { StateGraph, END, Annotation } from '@langchain/langgraph';
 import { ToolNode } from "@langchain/langgraph/prebuilt"
 import { RAGPipeline } from '../helper/mcpRag';
 import { tool } from "@langchain/core/tools";
@@ -8,7 +8,7 @@ import { z } from "zod";
 import { BaseMessage } from "@langchain/core/messages";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { getPrompts } from '../helper/prompts';
-import { memorySaver } from '../helper/memory';
+import { createRedisMemorySaver } from '../helper/memory';
 
 const seenThreads = new Set<string>();
 
@@ -87,8 +87,9 @@ export default async function stream_gemini(ctx: GSContext): Promise<GSStatus> {
   const { core_system_prompt, tool_knowledge_prompt } = getPrompts();
   const systemPromot = Array(core_system_prompt, tool_knowledge_prompt).join('\n');
 
+  const redisMemorySaver = createRedisMemorySaver(ctx);
   const runnable = graph.compile({
-    checkpointer: memorySaver
+    checkpointer: redisMemorySaver
   });
 
   const threadId = clientId;
